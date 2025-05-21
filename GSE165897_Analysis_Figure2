@@ -1,0 +1,201 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load environment
+```{r}
+library(ggrepel)
+library(Matrix)
+library(Seurat)
+library(ggpubr)
+library(tibble)
+library(dplyr)
+library(progress)
+```
+
+## Load data (available from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE165897)
+```{r}
+metadata <- read.table("GSE165897_cellInfo_HGSOC.tsv", header = T)
+metadata <- column_to_rownames(metadata, var = "cell")
+rownames(metadata) <- gsub(rownames(metadata), pattern = "-", replacement = ".")
+
+longitudinal <- CreateSeuratObject(counts = read.table("GSE165897_UMIcounts_HGSOC.tsv"), project = "Longitudinal_HGSOC", assay = "RNA")
+
+longitudinal <- AddMetaData(longitudinal, metadata = metadata)
+longitudinal$treatment_phase <- factor(longitudinal$treatment_phase, levels = c("treatment-naive", "post-NACT"))
+```
+
+## Dimensional reduction and plotting EPCAM and SOX9 at whole tissue level
+```{r}
+longitudinal <- SCTransform(longitudinal, vars.to.regress = "percent.mt", verbose = FALSE)
+
+longitudinal <- RunPCA(longitudinal, verbose = FALSE)
+ElbowPlot(longitudinal, ndims = 30)
+longitudinal <- RunUMAP(longitudinal, dims = 1:20, verbose = FALSE)
+
+longitudinal <- FindNeighbors(longitudinal, dims = 1:20, verbose = FALSE)
+longitudinal <- FindClusters(longitudinal, verbose = FALSE)
+DimPlot(longitudinal, label = TRUE) + NoLegend()
+
+FeaturePlot(longitudinal, features = c("EPCAM", "SOX9"), order = T)
+DimPlot(longitudinal, group.by = "treatment_phase")
+DimPlot(longitudinal, group.by = "patient_id")
+```
+
+## Subset for epithelial cells and look at SOX9 expression (both single and patient-paired levels) and treatment phase clustering at epithelial level
+```{r}
+# Subset for epithelial cells, get names of naive and post-NACT cells within this population
+ep_cells <- subset(longitudinal, subset = cell_type == "EOC")
+naive_cells <- names(ep_cells$treatment_phase[ep_cells$treatment_phase == "treatment-naive"])
+postNACT_cells <- names(ep_cells$treatment_phase[ep_cells$treatment_phase == "post-NACT"])
+
+# Reperform dimensional reduction on epithelial cells
+ep_cells <- RunPCA(ep_cells, verbose = FALSE)
+ElbowPlot(ep_cells, ndims = 30)
+ep_cells <- RunUMAP(ep_cells, dims = 1:20, verbose = FALSE, )
+
+ep_cells <- FindNeighbors(ep_cells, dims = 1:20, verbose = FALSE)
+ep_cells <- FindClusters(ep_cells, verbose = FALSE)
+DimPlot(ep_cells, label = TRUE) + NoLegend()
+
+# Plot UMAP of epithelium by treatment phase
+DimPlot(ep_cells, group.by = "treatment_phase")
+
+# Plot UMAP of SOX9 expression of epithelium
+FeaturePlot(ep_cells, features = "SOX9", order = T)
+
+# Plot SOX9 expression of epithelium by treatment phase at single cell level
+VlnPlot(ep_cells, features = "SOX9", group.by = "treatment_phase") + stat_compare_means(method = "wilcox.test")
+
+# Get sox9 expression within above groups
+sox9_expression <- c(AverageExpression(subset(ep_cells, subset = treatment_phase == "treatment-naive"), features = "SOX9", group.by = "patient_id", assays = "SCT"), AverageExpression(subset(ep_cells, subset = treatment_phase == "post-NACT"), features = "SOX9", group.by = "patient_id", assays = "SCT"))
+
+# Format table
+sox9_expression <- merge(t(sox9_expression[[1]]), t(sox9_expression[[2]]), by = "row.names")
+colnames(sox9_expression) <- c("Patient", "Naive", "PostNACT")
+sox9_expression$Naive <- log10(sox9_expression$Naive)
+sox9_expression$PostNACT <- log10(sox9_expression$PostNACT)
+
+# Plot patient-paired data of SOX9 expression in epithelial cells between naive and post-nact
+ggpaired(sox9_expression, cond1 = "Naive", cond2 = "PostNACT", fill = "condition", ylab = "log10(Average Expression)", title = "SOX9") + stat_compare_means(method = "wilcox.test", paired = TRUE) + theme(legend.position = "none")
+```
+
+## Calculate transcriptional divergence of epithelial cells
+```{r}
+data <- data.frame(ep_cells@assays$SCT@data)
+
+# transcriptional divergence is the ratio between the top 50% of expressing genes to the bottom 50% of expressing genes
+divergence <- data.frame()
+for (i in 1:length(colnames(data))){
+  cell <- data.frame(data[,i])
+  cell <- dplyr::filter(cell, cell$data...i. > 0)
+  top50 <- sum(top_frac(cell, n = 0.5, wt = data...i.))
+  bottom50 <- sum(top_frac(cell, n = -0.5, wt = data...i.))
+  p50p50 <- top50/bottom50
+  treatment <- ifelse(colnames(data)[i] %in% naive_cells, "Naive", "PostNACT")
+  patient_id <-  gsub("^.*\\.","", (colnames(data)[i]))
+  patient_id <- gsub("_.*", "", patient_id)
+  divergence[i,1:3] <- c(p50p50, treatment, patient_id)
+}
+
+# format table
+divergence$cell <- colnames(data)
+colnames(divergence) <- c("transcriptional_divergence", "treatment", "patient_id", "cell")
+divergence$treatment <- factor(divergence$treatment, levels = c("Naive", "PostNACT"))
+divergence$patient_id <- factor(divergence$patient_id)
+divergence$transcriptional_divergence <- as.numeric(divergence$transcriptional_divergence)
+
+ep_cells[["divergence"]] <- divergence$transcriptional_divergence
+
+# plot transcriptional divergence as density plot between treatment phases
+ggplot(divergence, aes(x = transcriptional_divergence, fill = treatment, alpha = 0.5)) +
+  geom_density() +
+  ggtitle("Transcriptional Divergence of all Epithelial Cells")
+
+
+# plot transcriptional divergence as violin plot between treatment phases
+ggplot(divergence, aes(x = treatment, y = transcriptional_divergence, fill = treatment)) +
+  geom_violin() +
+  geom_boxplot(width = 0.5, outlier.shape = NA) + 
+  stat_compare_means(method = "wilcox.test")
+```
+
+## Calculate spearman correlation for every gene against transcriptional divergence
+```{r}
+#trans_div_cor <- GetCorrelation(ep_cells_imputed, feature = "divergence")
+
+#trans_div_tf_cor <- trans_div_cor[trans_div_cor$gene %in% tfs, ]
+
+# initiate progress bar
+pb <- progress_bar$new(format = "(:spin) [:bar] :percent [Elapsed time: :elapsedfull || Estimated time remaining: :eta]",
+                       total = nrow(ep_cells),
+                       complete = "=",   # Completion bar character
+                       incomplete = "-", # Incomplete bar character
+                       current = ">",    # Current bar character
+                       clear = FALSE,    # If TRUE, clears the bar when finish
+                       width = 100)      # Width of the progress bar
+# get spearman correlations
+expression_divergence_spearman <- data.frame()
+for (i in 1:nrow(ep_cells)){
+  pb$tick()
+  gene <- row.names(ep_cells)[i]
+  expression <- as.numeric(as.vector(data[gene,]))
+  if (sum(expression) == 0){
+    next
+  }
+  transcriptional_divergence <- divergence$transcriptional_divergence
+  df <- data.frame(transcriptional_divergence, expression)
+  df <- dplyr::filter(df, df$expression != 0)
+  res <- tryCatch(suppressWarnings(cor.test(df$transcriptional_divergence, df$expression, method = "spearman")), 
+                  error = function(e) {return("Error")})
+  if ("Error" %in% res){
+    next
+  }
+  cor <- res$estimate
+  pval <- res$p.value
+  if (is.na(cor) | is.na(pval)){
+    next  
+  }
+  expression_divergence_spearman[(nrow(expression_divergence_spearman) + 1), 1:3] <- c(gene, cor, pval)
+}
+
+colnames(expression_divergence_spearman) <- c("gene", "rho", "p.val")
+expression_divergence_spearman <- mutate(expression_divergence_spearman, pval.adj = p.adjust(p.val, method = "fdr"))
+expression_divergence_spearman$rho <- as.numeric(expression_divergence_spearman$rho)
+
+# get list of all tfs (https://humantfs.ccbr.utoronto.ca/)
+tfs <- read.csv("1-s2.0-S0092867418301065-mmc2.csv")
+tfs <- dplyr::filter(tfs, tfs$Is.TF. == "Yes")$Name
+
+expression_divergence_spearman_tfs <- dplyr::filter(expression_divergence_spearman, expression_divergence_spearman$gene %in% tfs)
+
+# get positively correlated tfs
+expression_divergence_spearman_tf_pos <- dplyr::filter(expression_divergence_spearman_tfs, expression_divergence_spearman_tfs$rho > 0) %>% arrange(desc(pval.adj))
+
+expression_divergence_spearman_tf_pos$gene <- factor(expression_divergence_spearman_tf_pos$gene, levels = expression_divergence_spearman_tf_pos$gene)
+```
+
+## Plot transcriptional divergence spearman coefficient against differential expression FDR
+```{r}
+ep_cells <- SetIdent(ep_cells, value = "treatment_phase")
+naive_post_deg <- FindAllMarkers(ep_cells, assay = "SCT", only.pos = T)
+
+# divergence versus differential expression
+naive_post_deg_div <- merge(x=naive_post_deg[naive_post_deg$cluster=="post-NACT", ], y=expression_divergence_spearman_tf_pos, by="gene")
+
+naive_post_deg_div <- merge(x=naive_post_deg[naive_post_deg$avg_log2FC > 0, ], y=expression_divergence_spearman_tf_pos, by="gene")
+
+ggplot(naive_post_deg_div, aes(x = -log10(p_val_adj), y = -log10(pval.adj))) +
+  geom_point() +
+  xlab(label = "Differential Expression -log10(padj)") +
+  ylab(label = "Transcriptional Divergence Spearman -log10(padj)") +
+  geom_point(data = naive_post_deg_div[naive_post_deg_div$gene %in% c("NFIB", "NR4A1", "SOX9", "KLF4", "MYC"),],
+             aes(x = -log10(p_val_adj), y = -log10(pval.adj), color = "red")) +
+  geom_text_repel(data = naive_post_deg_div[naive_post_deg_div$gene %in% c("NFIB", "NR4A1", "SOX9", "KLF4", "MYC"),],  aes(x = -log10(p_val_adj), y = -log10(pval.adj), label = gene),
+                  direction = "y",
+                  size = 3,
+                  hjust = 0,
+                  segment.size = 0.1, 
+                  color = "Black",
+                  max.overlaps = 20)
+```
