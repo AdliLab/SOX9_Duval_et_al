@@ -183,8 +183,6 @@ naive_post_deg <- FindAllMarkers(ep_cells, assay = "SCT", only.pos = T)
 # divergence versus differential expression
 naive_post_deg_div <- merge(x=naive_post_deg[naive_post_deg$cluster=="post-NACT", ], y=expression_divergence_spearman_tf_pos, by="gene")
 
-naive_post_deg_div <- merge(x=naive_post_deg[naive_post_deg$avg_log2FC > 0, ], y=expression_divergence_spearman_tf_pos, by="gene")
-
 ggplot(naive_post_deg_div, aes(x = -log10(p_val_adj), y = -log10(pval.adj))) +
   geom_point() +
   xlab(label = "Differential Expression -log10(padj)") +
