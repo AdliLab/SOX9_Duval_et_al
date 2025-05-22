@@ -1,0 +1,198 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load environment
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(progress)
+library(stats)
+```
+
+## Load and format data
+```{r}
+# load orsulic tmas
+orsulic_tma1 <- read.table("Orsulic_TMA1_MachineLearning_Tumor_Stroma_Detection.txt", sep = "\t", header = T)
+orsulic_tma1$TMA <- "TMA1"
+orsulic_tma2 <- read.table("Orsulic_TMA2_MachineLearning_Tumor_Stroma_Detection.txt", sep = "\t", header = T)
+orsulic_tma2$TMA <- "TMA2"
+# remove hyphens from TMA core positions
+orsulic_tma1$Parent <- sapply(orsulic_tma1$Parent, function(x){
+  gsub("-", "", x)
+})
+
+orsulic_tma2$Parent <- sapply(orsulic_tma2$Parent, function(x){
+  gsub("-", "", x)
+})
+
+# load whole tissue measurements in order to remove missing cores
+orsulic_total_tma1 <- read.table("Orsulic_TMA1_TotalTMA_Detections.txt", sep = "\t", header = T)
+
+orsulic_total_tma1$Name <- sapply(orsulic_total_tma1$Name, function(x){
+  gsub("-", "", x)
+})
+
+orsulic_total_tma2 <- read.table("Orsulic_TMA2_TotalTMA_Detections.txt", sep = "\t", header = T)
+
+orsulic_total_tma2$Name <- sapply(orsulic_total_tma2$Name, function(x){
+  gsub("-", "", x)
+})
+
+
+#filter out missing cores from data
+orsulic_tma1_notMissing <- orsulic_total_tma1[orsulic_total_tma1$Missing == "False", ]$Name
+orsulic_tma1 <- orsulic_tma1[orsulic_tma1$Parent %in% orsulic_tma1_notMissing, ]
+
+orsulic_tma2_notMissing <- orsulic_total_tma2[orsulic_total_tma2$Missing == "False", ]$Name
+orsulic_tma2 <- orsulic_tma2[orsulic_tma2$Parent %in% orsulic_tma2_notMissing, ]
+
+
+orsulic_tma <- rbind(orsulic_tma1, orsulic_tma2)
+
+# load metadata
+orsulic_metadata <- read.csv("Orsulic_metadata.csv", sep = ",", header = T, na.strings=c("","NA"))
+
+orsulic_metadata_tma1 <- dplyr::filter(orsulic_metadata, orsulic_metadata$TMA1orTMA2 == "TMA1")
+
+orsulic_metadata_tma2 <- dplyr::filter(orsulic_metadata, orsulic_metadata$TMA1orTMA2 == "TMA2")
+
+# combine data with metadata
+orsulic_all_metadata_tma1 <- matrix(unlist(sapply(orsulic_tma1$Parent, function(x) {
+  orsulic_metadata_tma1[orsulic_metadata_tma1$Core == x,]
+})), nrow = nrow(orsulic_tma1), ncol = ncol(orsulic_metadata_tma1), byrow = TRUE)
+
+orsulic_all_metadata_tma2 <- matrix(unlist(sapply(orsulic_tma2$Parent, function(x) {
+  orsulic_metadata_tma2[orsulic_metadata_tma2$Core == x,]
+})), nrow = nrow(orsulic_tma2), ncol = ncol(orsulic_metadata_tma2), byrow = TRUE)
+
+orsulic_all_metadata <- rbind(orsulic_all_metadata_tma1, orsulic_all_metadata_tma2)
+
+colnames(orsulic_all_metadata) <- colnames(orsulic_metadata)
+
+orsulic_tma <- data.frame(cbind(orsulic_tma, orsulic_all_metadata))
+
+# fix mutation status column
+orsulic_tma$Mutatio_Status <- trimws(orsulic_tma$Mutatio_Status, which = "right")
+
+# set order
+orsulic_tma$Primary_Met_Recurr <- factor(orsulic_tma$Primary_Met_Recurr, levels = c("primary tumor", "metastatic tumor", "recurrence tumor"))
+
+# change "tumor cell" label into "epithelial cell" label
+orsulic_tma$Class <- sapply(orsulic_tma$Class, function(x){
+  ifelse(x == "Tumor", return("Epithelial"), return(x))
+})
+
+orsulic_tma$tissue_type <- ifelse(orsulic_tma$Tissue == "fallopiantube", "FT", ifelse(grepl(pattern = "OV", x = orsulic_tma$Tissue), "Tumor", NA))
+
+orsulic_tma$chemo_status <- ifelse(is.na(orsulic_tma$tissue_type) == TRUE, NA, ifelse(orsulic_tma$Primary_Met_Recurr == "primary tumor" | orsulic_tma$Primary_Met_Recurr == "metastatic tumor", "Chemo-Naive", "Post-NACT"))
+
+orsulic_tma$tissue_name <- ifelse(is.na(orsulic_tma$tissue_type) == TRUE, NA, ifelse(orsulic_tma$tissue_type == "FT", paste(orsulic_tma$tissue_type, orsulic_tma$Class, sep = "_"), paste(orsulic_tma$chemo_status, orsulic_tma$tissue_type, orsulic_tma$Class, sep = "_")))
+
+orsulic_tma$tissue_name <- factor(orsulic_tma$tissue_name, levels = c("FT_Stroma", "FT_Epithelial", "Chemo-Naive_Tumor_Stroma", "Chemo-Naive_Tumor_Epithelial", "Post-NACT_Tumor_Stroma", "Post-NACT_Tumor_Epithelial"))
+```
+
+# Calculate nuclear H scores
+```{r}
+orsulic_tma_h_scores <- data.frame()
+data <- orsulic_tma[is.na(orsulic_tma$tissue_name) == FALSE, ]
+pos <- data[data$Nucleus..DAB.OD.mean > 0, ]
+quantiles <- quantile(pos$Nucleus..DAB.OD.mean, probs = c(0.33, 0.66, 1))
+# tma level
+for (i in 1:length(levels(factor(data$TMA1orTMA2)))){
+  tma <- levels(factor(data$TMA1orTMA2))[i]
+  data_i <- data[data$TMA1orTMA2 == tma, ]
+  # tissue name level
+  for (j in 1:length(levels(factor(data_i$tissue_name)))){
+    tissue_name <- levels(factor(data_i$tissue_name))[j]
+    data_j <- data_i[data_i$tissue_name == tissue_name, ]
+    # tissue level
+    for (k in 1:length(levels(factor(data_j$Parent)))){
+      parent <- levels(factor(data_j$Parent))[k]
+      data_k <- data_j[data_j$Parent == parent, ]
+      n <- sum(data_j$Nucleus..DAB.OD.mean <= 0)
+      data_k_pos <- data_k[data_k$Nucleus..DAB.OD.mean > 0, ]
+      low <- sum(data_k_pos$Nucleus..DAB.OD.mean <= quantiles[1])
+      mid <- sum(data_k_pos$Nucleus..DAB.OD.mean > quantiles[1] & data_k_pos$Nucleus..DAB.OD.mean <= quantiles[2])
+      high <- sum(data_k_pos$Nucleus..DAB.OD.mean > quantiles[2] & data_k_pos$Nucleus..DAB.OD.mean <= quantiles[3])
+      h_score <- 100*((3*high + 2*mid + low)/(high + mid + low + n))
+      patient<- ifelse(sum(is.na(data_k_pos$Patient.) == F) == 0, NA, paste0(data_k_pos$Patient.[1], "_", tma))
+      row <- c(tma, tissue_name, parent, patient, h_score)
+      orsulic_tma_h_scores <- rbind(orsulic_tma_h_scores, row)
+    }
+  }  
+}
+
+colnames(orsulic_tma_h_scores) <- c("TMA", "Tissue_Name", "Parent", "Patient", "H_Score")
+orsulic_tma_h_scores$H_Score <- as.numeric(orsulic_tma_h_scores$H_Score)
+orsulic_tma_h_scores$Tissue_Name <- factor(orsulic_tma_h_scores$Tissue_Name, levels = c("FT_Stroma", "FT_Epithelial", "Chemo-Naive_Tumor_Stroma", "Chemo-Naive_Tumor_Epithelial", "Post-NACT_Tumor_Stroma", "Post-NACT_Tumor_Epithelial"))
+
+orsulic_tma_epithelial_h_scores <- filter(orsulic_tma_h_scores, Tissue_Name != "FT_Epithelial" & Tissue_Name != "FT_Stroma" & Tissue_Name != "Chemo-Naive_Tumor_Stroma" & Tissue_Name != "Post-NACT_Tumor_Stroma")
+
+orsulic_tma_stroma_epithelial_h_scores <- filter(orsulic_tma_h_scores, Tissue_Name != "FT_Epithelial" & Tissue_Name != "FT_Stroma")
+
+## Epithelial H-scores
+ggplot(orsulic_tma_epithelial_h_scores, aes(y = H_Score, x = Tissue_Name, fill = Tissue_Name)) + geom_violin(trim = F, show.legend = F) + geom_boxplot(width = 0.2, show.legend = F) + stat_compare_means(method = "wilcox.test", comparisons = list(c("Chemo-Naive_Tumor_Epithelial","Post-NACT_Tumor_Epithelial"))) +
+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+scale_y_log10()
+
+## Epithelial and stromal H-scores
+ggplot(orsulic_tma_stroma_epithelial_h_scores, aes(y = H_Score, x = Tissue_Name, fill = Tissue_Name)) + geom_violin(trim = F, show.legend = F) + geom_boxplot(width = 0.2, show.legend = F) + stat_compare_means(method = "wilcox.test", comparisons = list(c("Chemo-Naive_Tumor_Epithelial","Chemo-Naive_Tumor_Stroma"), c("Post-NACT_Tumor_Epithelial", "Post-NACT_Tumor_Stroma"))) +
+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+scale_y_log10()
+```
+
+## Cytoplasmic H-scores
+```{r}
+# Calculate cytoplasmic H scores
+orsulic_tma_cyto_h_scores <- data.frame()
+data <- orsulic_tma[is.na(orsulic_tma$tissue_name) == FALSE, ]
+pos <- data[data$Cytoplasm..DAB.OD.mean > 0, ]
+quantiles <- quantile(pos$Cytoplasm..DAB.OD.mean, probs = c(0.33, 0.66, 1))
+# tma level
+for (i in 1:length(levels(factor(data$TMA1orTMA2)))){
+  tma <- levels(factor(data$TMA1orTMA2))[i]
+  data_i <- data[data$TMA1orTMA2 == tma, ]
+  # tissue name level
+  for (j in 1:length(levels(factor(data_i$tissue_name)))){
+    tissue_name <- levels(factor(data_i$tissue_name))[j]
+    data_j <- data_i[data_i$tissue_name == tissue_name, ]
+    # tissue level
+    for (k in 1:length(levels(factor(data_j$Parent)))){
+      parent <- levels(factor(data_j$Parent))[k]
+      data_k <- data_j[data_j$Parent == parent, ]
+      n <- sum(data_j$Cytoplasm..DAB.OD.mean <= 0)
+      data_k_pos <- data_k[data_k$Cytoplasm..DAB.OD.mean > 0, ]
+      low <- sum(data_k_pos$Cytoplasm..DAB.OD.mean <= quantiles[1])
+      mid <- sum(data_k_pos$Cytoplasm..DAB.OD.mean > quantiles[1] & data_k_pos$Cytoplasm..DAB.OD.mean <= quantiles[2])
+      high <- sum(data_k_pos$Cytoplasm..DAB.OD.mean > quantiles[2] & data_k_pos$Cytoplasm..DAB.OD.mean <= quantiles[3])
+      h_score <- 100*((3*high + 2*mid + low)/(high + mid + low + n))
+      patient<- ifelse(sum(is.na(data_k_pos$Patient.) == F) == 0, NA, paste0(data_k_pos$Patient.[1], "_", tma))
+      row <- c(tma, tissue_name, parent, patient, h_score)
+      orsulic_tma_cyto_h_scores <- rbind(orsulic_tma_cyto_h_scores, row)
+    }
+  }  
+}
+
+colnames(orsulic_tma_cyto_h_scores) <- c("TMA", "Tissue_Name", "Parent", "Patient", "H_Score")
+orsulic_tma_cyto_h_scores$H_Score <- as.numeric(orsulic_tma_cyto_h_scores$H_Score)
+orsulic_tma_cyto_h_scores$Tissue_Name <- factor(orsulic_tma_cyto_h_scores$Tissue_Name, levels = c("FT_Stroma", "FT_Epithelial", "Chemo-Naive_Tumor_Stroma", "Chemo-Naive_Tumor_Epithelial", "Post-NACT_Tumor_Stroma", "Post-NACT_Tumor_Epithelial"))
+
+orsulic_tma_epithelial_cyto_h_scores <- filter(orsulic_tma_cyto_h_scores, Tissue_Name != "FT_Epithelial" & Tissue_Name != "FT_Stroma" & Tissue_Name != "Chemo-Naive_Tumor_Stroma" & Tissue_Name != "Post-NACT_Tumor_Stroma")
+
+orsulic_tma_stroma_epithelial_cyto_h_scores <- filter(orsulic_tma_cyto_h_scores, Tissue_Name != "FT_Epithelial" & Tissue_Name != "FT_Stroma")
+
+## Epithelial H-scores
+ggplot(orsulic_tma_epithelial_cyto_h_scores, aes(y = H_Score, x = Tissue_Name, fill = Tissue_Name)) + geom_violin(trim = F, show.legend = F) + geom_boxplot(width = 0.2, show.legend = F) + stat_compare_means(method = "wilcox.test", comparisons = list(c("Chemo-Naive_Tumor_Epithelial","Post-NACT_Tumor_Epithelial"))) +
+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+scale_y_log10() +
+  ggtitle(label = "Cytoplasmic H-scores")
+
+## Epithelial and stromal H-scores
+ggplot(orsulic_tma_stroma_epithelial_cyto_h_scores, aes(y = H_Score, x = Tissue_Name, fill = Tissue_Name)) + geom_violin(trim = F, show.legend = F) + geom_boxplot(width = 0.2, show.legend = F) + stat_compare_means(method = "wilcox.test", comparisons = list(c("Chemo-Naive_Tumor_Epithelial","Chemo-Naive_Tumor_Stroma"), c("Post-NACT_Tumor_Epithelial", "Post-NACT_Tumor_Stroma"))) +
+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
+scale_y_log10() +
+  ggtitle(label = "Cytoplasmic H-scores")
+
+```
