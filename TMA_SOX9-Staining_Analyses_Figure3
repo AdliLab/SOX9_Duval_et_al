@@ -194,5 +194,4 @@ ggplot(orsulic_tma_stroma_epithelial_cyto_h_scores, aes(y = H_Score, x = Tissue_
 theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + 
 scale_y_log10() +
   ggtitle(label = "Cytoplasmic H-scores")
-
 ```
