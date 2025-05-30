@@ -1,0 +1,197 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load environment
+```{r, message=FALSE}
+library(DESeq2)
+library(dplyr)
+library(biomaRt)
+library(pheatmap)
+library(ggplot2)
+library(dendextend)
+library(ggrepel)
+```
+
+### Get gene symbol annotation data
+```{r}
+#Get gene symbols from ensembl IDs
+ensembl <- useMart("ensembl")
+datasets <- listDatasets(ensembl)
+ensembl <- useDataset("hsapiens_gene_ensembl",mart=ensembl)
+
+geneNames <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name'), 
+      filters = 'ensembl_gene_id', 
+      values = row_names[-c(1:4)], 
+      mart = ensembl)
+
+#Reorder gene name order to match countData dataframe
+geneNames <- geneNames[match(row_names[-c(1:4)], geneNames$ensembl_gene_id),]
+```
+
+### Function to query ENSEMBL IDs and return Official Gene Symbols
+```{r}
+GetGeneNames <- function(ensemblID){
+  ifelse(ensemblID%in%geneNames$ensembl_gene_id,
+         return(geneNames[which(geneNames==ensemblID, arr.ind = TRUE)[,1],2]),
+         return(ensemblID))
+}
+```
+
+
+### Naive vs. Resistant DE
+```{r}
+#Import alternative sample info csv
+NaiveResist_sample_info <- read.table("NaiveResist_sample_info.txt")
+
+#Import count data
+NaiveResist_countData <- read.table("NaiveResist_countData.txt")
+
+NaiveResist_myDesign <- ~ Group
+
+NaiveResist_dds <- DESeqDataSetFromMatrix(countData = NaiveResist_countData,
+                              colData = NaiveResist_sample_info,
+                              design = NaiveResist_myDesign)
+
+
+NaiveResist_keep <- rowSums(counts(NaiveResist_dds)) >= 10
+NaiveResist_dds <- NaiveResist_dds[NaiveResist_keep,]
+
+#Differential expression analysis\
+NaiveResist_dds <- DESeq(NaiveResist_dds,
+                         minReplicatesForReplace=Inf)
+NaiveResist_res <- results(NaiveResist_dds,
+                           cooksCutoff=FALSE,
+                           independentFiltering=FALSE,
+                           contrast = c("Group", "Resist","Naive"),
+                           pAdjustMethod = 'fdr')
+NaiveResist_vsd <- vst(NaiveResist_dds,
+                       blind = FALSE)
+
+#Add official gene symbols to results
+NaiveResist_res$GeneSymbol <- sapply(rownames(NaiveResist_res), GetGeneNames)
+
+#Select positive, negative LFCs and significant DE genes
+NaiveResist_res_df <- as.data.frame(NaiveResist_res)
+NaiveResist_select_posLFC <- filter(NaiveResist_res_df, NaiveResist_res_df$log2FoldChange > 0)
+NaiveResist_select_negLFC <- filter(NaiveResist_res_df, NaiveResist_res_df$log2FoldChange < 0)
+NaiveResist_select_sig <- filter(NaiveResist_res_df, NaiveResist_res_df$pvalue<0.05)
+NaiveResist_select_sig_posLFC <- filter(NaiveResist_select_sig, NaiveResist_select_sig$log2FoldChange >0)
+NaiveResist_select_sig_negLFC <- filter(NaiveResist_select_sig, NaiveResist_select_sig$log2FoldChange <0)
+
+# Get column data for annotation
+NaiveResist_col_df <- as.data.frame(colData(NaiveResist_dds)[,c("SampleName", "Group")])
+
+
+#Plot heatmap of most significant DE genes
+NaiveResist_sig_heatmap <- pheatmap(assay(NaiveResist_vsd)[rownames(NaiveResist_select_sig),],
+                    cluster_rows = TRUE, 
+                    show_rownames = FALSE,
+                    cluster_cols = TRUE, 
+                    annotation_col = NaiveResist_col_df,
+                    scale = 'row', 
+                    border_color = NA,
+                    cutree_rows = 2)
+
+#Get number of genes significantly upregulated and downregulated in Resist vs Naive groups
+length(row.names(filter(NaiveResist_select_sig, NaiveResist_select_sig$log2FoldChange>0)))
+length(row.names(filter(NaiveResist_select_sig, NaiveResist_select_sig$log2FoldChange<0)))
+```
+
+### NTsg vs SOX9sg
+```{r}
+#Import sample info 
+SOX9vNT_sample_info <- read.table("SOX9vNT_sample_info.txt")
+
+#Import count data
+SOX9vNT_countData <- read.table("SOX9vNT_CountData")
+
+SOX9vNT_myDesign <- ~ Group
+SOX9vNT_dds <- DESeqDataSetFromMatrix(countData = SOX9vNT_countData,
+                              colData = SOX9vNT_sample_info,
+                              design = SOX9vNT_myDesign)
+SOX9vNT_keep <- rowSums(counts(SOX9vNT_dds)) >= 10
+SOX9vNT_dds <- SOX9vNT_dds[SOX9vNT_keep,]
+
+# Differential expression analysis
+SOX9vNT_dds <- DESeq(SOX9vNT_dds, minReplicatesForReplace=Inf)
+SOX9vNT_res <- results(SOX9vNT_dds,
+                       cooksCutoff=FALSE,
+                       independentFiltering=FALSE,
+                       contrast = c("Group", "SOX9sg", "NTsg"),
+                       pAdjustMethod = 'fdr')
+SOX9vNT_vsd <- vst(SOX9vNT_dds,
+                   blind = FALSE)
+
+SOX9vNT_res_df <- as.data.frame(SOX9vNT_res)
+SOX9vNT_vsd_df <- as.data.frame(assay(SOX9vNT_vsd))
+
+#Add official gene symbols to results
+SOX9vNT_res$GeneSymbol <- sapply(rownames(SOX9vNT_res), GetGeneNames)
+
+#Integrate SOX9 ChIP data
+SOX9_ChIP_genes <- read.csv("ChIP_gene_names.csv", sep = "\t")
+SOX9vNT_res$SOX9_ChIP_gene <- SOX9vNT_res$GeneSymbol%in%SOX9_ChIP_genes$x
+
+#Select positive, negative LFCs and significant DE genes
+SOX9vNT_res_df <- as.data.frame(SOX9vNT_res)
+SOX9vNT_select_posLFC <- filter(SOX9vNT_res_df, SOX9vNT_res$log2FoldChange > 0)
+SOX9vNT_select_negLFC <- filter(SOX9vNT_res_df, SOX9vNT_res_df$log2FoldChange < 0)
+SOX9vNT_select_sig <- filter(SOX9vNT_res_df, SOX9vNT_res_df$pvalue<0.05)
+SOX9vNT_select_sig_posLFC <- filter(SOX9vNT_select_sig, SOX9vNT_select_sig$log2FoldChange >0)
+SOX9vNT_select_sig_negLFC <- filter(SOX9vNT_select_sig, SOX9vNT_select_sig$log2FoldChange <0)
+
+# Get column data for annotation
+SOX9vNT_col_df <- as.data.frame(colData(SOX9vNT_dds)[,c("SampleName", "Group")])
+
+# Plot heatmap of most significant DE genes
+SOX9vNT_sig_heatmap <- pheatmap(assay(SOX9vNT_vsd)[rownames(SOX9vNT_select_sig),], 
+                     cluster_rows = TRUE, 
+                     show_rownames = FALSE, 
+                     cluster_cols = TRUE, 
+                     annotation_col = SOX9vNT_col_df, 
+                     scale = 'row', 
+                     border_color = NA,
+                     cutree_rows = 2)
+
+#Get number of genes significantly upregulated and downregulated in SOX9sg vs NTsg groups
+length(row.names(filter(SOX9vNT_select_sig, SOX9vNT_select_sig$log2FoldChange>0)))
+length(row.names(filter(SOX9vNT_select_sig, SOX9vNT_select_sig$log2FoldChange<0)))
+
+```
+
+### Plot NaiveResist_select_sig_posLFC and negLFC genes in SOX9vNT_select_sig
+```{r}
+Overlap_NaiveResistUpreg_SOX9vNTsig <- merge(NaiveResist_select_sig_posLFC, SOX9vNT_select_sig, by = 'row.names')
+
+Overlap_SOX9_Upreg_heatmap <- pheatmap(assay(SOX9vNT_vsd)[Overlap_NaiveResistUpreg_SOX9vNTsig$Row.names,], 
+                     cluster_rows = TRUE, 
+                     show_rownames = FALSE, 
+                     cluster_cols = TRUE, 
+                     annotation_col = SOX9vNT_col_df, 
+                     scale = 'row', 
+                     border_color = NA,
+                     cutree_rows = 2)
+
+
+
+Overlap_NaiveResistDownreg_SOX9vNTsig <- merge(NaiveResist_select_sig_negLFC, SOX9vNT_select_sig, by = 'row.names')
+
+
+Overlap_SOX9_Downreg_heatmap <- pheatmap(assay(SOX9vNT_vsd)[Overlap_NaiveResistDownreg_SOX9vNTsig$Row.names,], 
+                     cluster_rows = TRUE, 
+                     show_rownames = FALSE, 
+                     cluster_cols = TRUE, 
+                     annotation_col = SOX9vNT_col_df, 
+                     scale = 'row', 
+                     border_color = NA,
+                     cutree_rows = 2)
+
+Overlap_SOX9_Upreg <- filter(Overlap_NaiveResistUpreg_SOX9vNTsig, Overlap_NaiveResistUpreg_SOX9vNTsig$log2FoldChange.y>0)
+
+Overlap_SOX9_Downreg <- filter(Overlap_NaiveResistDownreg_SOX9vNTsig, Overlap_NaiveResistDownreg_SOX9vNTsig$log2FoldChange.y<0)
+
+write.csv(Overlap_SOX9_Upreg$Row.names, "Overlap_SOX9_Upreg.csv", quote = FALSE, row.names = FALSE)
+write.csv(Overlap_SOX9_Downreg$Row.names, "Overlap_SOX9_Downreg.csv", quote = FALSE, row.names = FALSE)
+```
