@@ -1,0 +1,102 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load environment
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+```
+
+## Load data
+```{r}
+ovcar_cds <- readRDS("cds_ovcar.rds")
+
+ovcar_counts <- data.frame(ovcar_cds@assayData$exprs)
+ovcar_metadata <- ovcar_cds@phenoData@data$sample
+names(ovcar_metadata) <- colnames(ovcar_counts)
+
+ovcar_seurat <- CreateSeuratObject(counts = ovcar_counts, project = "ovcar_seurat")
+ovcar_seurat[["sample"]] <- ovcar_metadata
+
+#filter for naive and 24-hour cisplatin-treated
+ovcar_seurat <- subset(ovcar_seurat, subset = sample == "Naive" | sample == "Cisplatin")
+ovcar_seurat$sample <- factor(ovcar_seurat$sample, levels = c("Naive", "Cisplatin"))
+```
+
+## QC
+```{r}
+ovcar_seurat[["percent.mt"]] <- PercentageFeatureSet(ovcar_seurat, pattern = "^MT-")
+
+VlnPlot(ovcar_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+## QC has already occurred, move onto normalization and visualization
+```{r}
+# run sctransform
+ovcar_seurat <- SCTransform(ovcar_seurat, vars.to.regress = "percent.mt", verbose = FALSE)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+ovcar_seurat <- RunPCA(ovcar_seurat, verbose = FALSE)
+ElbowPlot(ovcar_seurat, ndims = 30)
+```
+
+## Continue analysis with proper number of dimensions
+```{r}
+ovcar_seurat <- RunUMAP(ovcar_seurat, dims = 1:20, verbose = FALSE)
+
+ovcar_seurat <- FindNeighbors(ovcar_seurat, dims = 1:20, verbose = FALSE)
+ovcar_seurat <- FindClusters(ovcar_seurat, verbose = FALSE)
+DimPlot(ovcar_seurat, label = TRUE, group.by = "sample")
+
+```
+
+## Check expression of genes and gene modules
+```{r}
+# SOX9
+VlnPlot(ovcar_seurat, features = "SOX9", group.by = "sample") + 
+    stat_compare_means(method = "wilcox.test") + 
+    ylim(c(-0.25, 2.5)) +
+    geom_boxplot(width = 0.4)
+
+# stress module
+stress_module <- c("CEBPB", "CEBPD", "FOS", "IL6", "JUN", "JUNB", "MCL1", "MYC", "SOCS3", "ATF3", "DUSP1", "EGR1", "FOSB", "CEBPA", "DDIT3", "EGR2", "CDKN1A", "GADD45B", "TNF", "HES1", "HBEGF", "BCL6", "NR4A1", "DUSP6", "GADD45G", "ID2", "NFKBIA", "PLK3", "SNAI2", "CREB5", "HLA-G", "HIST1H2BC", "HIST1H2BG", "CALML3", "SNAI1")
+
+ovcar_seurat <- AddModuleScore(ovcar_seurat,
+                                features = list(stress_module),
+                                name = "stress_module")
+
+VlnPlot(ovcar_seurat, features = "stress_module1", group.by = "sample") + 
+  stat_compare_means(method = "wilcox.test") +
+  geom_boxplot(width = 0.4) +
+  ylim(c(-0.5, 1.5))
+
+
+# Engelmann cancer progenitors
+engelmann_module <- read.table("ENGELMANN_CANCER_PROGENITORS_UP.v7.5.1.grp")[-1,]
+ovcar_seurat <- AddModuleScore(ovcar_seurat,
+                                      features = list(engelmann_module),
+                                      name = "engelmann_module")
+
+VlnPlot(ovcar_seurat, features = "engelmann_module1", group.by = "sample") + 
+  stat_compare_means(method = "wilcox.test") +
+  ylim(c(-0.25, 0.7)) + 
+  geom_boxplot(width=0.4)
+
+# OC FACS stem markers
+stem_markers <- c("PROM1", "CD44", "ALDH1A1", "CD24", "KIT", "ENG", "VCAM1", "EPCAM", "NES", "SOX2", "SSEA1", "THY1")
+
+ovcar_seurat <- AddModuleScore(ovcar_seurat,
+                                      features = list(stem_markers),
+                                      name = "stem_markers")
+
+VlnPlot(ovcar_seurat, features = "stem_markers1") + stat_compare_means(method = "wilcox.test")
+
+## Feature plots
+FeaturePlot(ovcar_seurat, features = "SOX9", order = T)
+```
+
+
