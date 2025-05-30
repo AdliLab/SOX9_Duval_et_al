@@ -1,0 +1,283 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load environment
+```{r, echo=FALSE}
+library(Signac)
+library(Seurat)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomeInfoDb)
+library(chromVAR)
+library(JASPAR2020)
+library(TFBSTools)
+library(ggplot2)
+library(ggrepel)
+library(Matrix)
+library(dplyr)
+```
+
+# load the RNA and ATAC data
+```{r}
+counts <-Read10X("path/to/matrix/directory”)
+fragpath <- "path/to/atac/fragments/"
+```
+## create Seurat object
+```{r}
+# get gene annotations for hg38
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+annotation <- renameSeqlevels(annotation, mapSeqlevels(seqlevels(annotation), "UCSC"))
+
+
+# create a Seurat object containing the RNA data
+multiome_1_enriched <- CreateSeuratObject(
+  counts = counts$`Gene Expression`,
+  assay = "RNA"
+)
+
+# create ATAC assay and add it to the object
+multiome_1_enriched[["ATAC"]] <- CreateChromatinAssay(
+  counts = counts$Peaks,
+  sep = c(":", "-"),
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+## QC
+```{r}
+DefaultAssay(multiome_1_enriched) <- "ATAC"
+
+multiome_1_enriched <- NucleosomeSignal(multiome_1_enriched)
+
+multiome_1_enriched <- TSSEnrichment(multiome_1_enriched)
+
+multiome_1_enriched[["percent.mt"]] <- PercentageFeatureSet(multiome_1_enriched, pattern = "^MT", assay = "RNA")
+
+VlnPlot(
+  object = multiome_1_enriched,
+  features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal", "percent.mt"),
+  ncol = 4,
+  pt.size = 0
+)
+```
+
+## Filter out low quality cells
+```{r}
+multiome_1_enriched <- subset(
+  x = multiome_1_enriched,
+  subset = nCount_ATAC < 1e5 &
+    nCount_RNA < 1e5 &
+    nCount_ATAC > 1000 &
+    nCount_RNA > 1000 &
+    nucleosome_signal < 2 &
+    TSS.enrichment > 1 &
+    percent.mt < 50
+)
+
+```
+
+## Peak calling https://genome.ucsc.edu/cgi-bin/hgBlat
+```{r}
+# call peaks using MACS2
+peaks <- CallPeaks(multiome_1_enriched, macs2.path = "path/to/macs2")
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(multiome_1_enriched),
+  features = peaks,
+  cells = colnames(multiome_1_enriched)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+multiome_1_enriched[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+## Analysis of RNA
+```{r}
+# RNA analysis
+DefaultAssay(multiome_1_enriched) <- "RNA"
+
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+# score
+multiome_1_enriched <- CellCycleScoring(multiome_1_enriched, s.features = s.genes, g2m.features = g2m.genes, )
+
+
+multiome_1_enriched <- SCTransform(multiome_1_enriched, verbose = FALSE) %>% RunPCA() 
+
+ElbowPlot(multiome_1_enriched, ndims = 30)
+```
+## RNA analysis continued
+```{r}
+multiome_1_enriched <- RunUMAP(multiome_1_enriched, dims = 1:20, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DimPlot(multiome_1_enriched, reduction = "umap.rna", label = T)
+```
+## ATAC analysis
+```{r}
+# We exclude the first dimension as this is typically correlated with sequencing depth
+DefaultAssay(multiome_1_enriched) <- "peaks"
+multiome_1_enriched <- RunTFIDF(multiome_1_enriched)
+multiome_1_enriched <- FindTopFeatures(multiome_1_enriched, min.cutoff = 'q0')
+multiome_1_enriched <- RunSVD(multiome_1_enriched)
+multiome_1_enriched <- RunUMAP(multiome_1_enriched, reduction = 'lsi', dims = 2:20, reduction.name = "umap.peaks", reduction.key = "peaksDimUMAP_")
+
+
+## WNN
+multiome_1_enriched <- FindMultiModalNeighbors(multiome_1_enriched, reduction.list = list("pca", "lsi"), dims.list = list(1:20, 2:20))
+multiome_1_enriched <- RunUMAP(multiome_1_enriched, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+multiome_1_enriched <- FindClusters(multiome_1_enriched, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+
+DimPlot(multiome_1_enriched, reduction = "wnn.umap", label = TRUE)
+```
+
+## Remove outlier clusters (NOTE: these may be different depending on your clustering)
+```{r}
+multiome_1_enriched <- subset(multiome_1_enriched, subset = seurat_clusters != 12 & seurat_clusters != 13)
+
+# reperform UMAP of RNA
+multiome_1_enriched <- RunUMAP(multiome_1_enriched, dims = 1:20, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+```
+
+## Cluster-specific peak calling
+```{r}
+DefaultAssay(multiome_1_enriched) <- "ATAC"
+
+# call peaks using MACS2
+cluster_peaks <- CallPeaks(multiome_1_enriched, macs2.path = "/Users/LURIE4121/miniconda3/bin/macs2", group.by = "seurat_clusters")
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+cluster_peaks <- keepStandardChromosomes(cluster_peaks, pruning.mode = "coarse")
+cluster_peaks <- subsetByOverlaps(x = cluster_peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(multiome_1_enriched),
+  features = cluster_peaks,
+  cells = colnames(multiome_1_enriched)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+multiome_1_enriched[["cluster_peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+## Cluster-specific peak analysis and WNN
+```{r}
+# ATAC analysis
+# We exclude the first dimension as this is typically correlated with sequencing depth
+DefaultAssay(multiome_1_enriched) <- "cluster_peaks"
+multiome_1_enriched <- RunTFIDF(multiome_1_enriched)
+multiome_1_enriched <- FindTopFeatures(multiome_1_enriched, min.cutoff = 'q0')
+multiome_1_enriched <- RunSVD(multiome_1_enriched)
+multiome_1_enriched <- RunUMAP(multiome_1_enriched, reduction = 'lsi', dims = 2:20, reduction.name = "umap.peaks", reduction.key = "peaksDimUMAP_")
+
+## WNN
+multiome_1_enriched <- FindMultiModalNeighbors(multiome_1_enriched, reduction.list = list("pca", "lsi"), dims.list = list(1:20, 2:20))
+multiome_1_enriched <- RunUMAP(multiome_1_enriched, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+multiome_1_enriched <- FindClusters(multiome_1_enriched, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+
+DimPlot(multiome_1_enriched, reduction = "wnn.umap", label = TRUE)
+```
+
+## ALRA imputation to resolve technical zeroes while preserving biological zeroes
+```{r}
+DefaultAssay(multiome_1_enriched) <- "SCT"
+multiome_1_enriched[["imputed_sct"]] <- alraSeurat3(multiome_1_enriched)[["SCT"]]
+
+multiome_1_enriched_imputed <- RunPCA(multiome_1_enriched_imputed) %>% RunUMAP(dims = 1:20, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+## Repeat WNN with imputed expression values
+multiome_1_enriched_imputed <- FindMultiModalNeighbors(multiome_1_enriched_imputed, reduction.list = list("pca", "lsi"), dims.list = list(1:20, 2:20))
+multiome_1_enriched_imputed <- RunUMAP(multiome_1_enriched_imputed, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+multiome_1_enriched_imputed <- FindClusters(multiome_1_enriched_imputed, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+
+DimPlot(multiome_1_enriched_imputed, reduction = "wnn.umap", label = TRUE)
+FeaturePlot(multiome_1_enriched_imputed, features = “SOX9”, reduction =  “wnn.umap”, order = TRUE, label = TRUE)
+VlnPlot(multiome_1_enriched_imputed, features = “SOX9)
+```
+## Query gene modules in gene expression assay
+```{r}
+# OC stem markers
+oc_stem <- c("PROM1", "CD44", "ALDH1A1", "CD24", "KIT", "VCAM1", "EPCAM", "SOX2", "NES")
+multiome_1_enriched_imputed <- AddModuleScore(multiome_1_enriched_imputed,
+                                              features = list(oc_stem),
+                                              name = "oc_stem")
+VlnPlot(multiome_1_enriched_imputed, features = “oc_stem1”)
+# stress module
+stress_module <- c("CEBPB", "CEBPD", "FOS", "IL6", "JUN", "JUNB", "MCL1", "MYC", "SOCS3", "ATF3", "DUSP1", "EGR1", "FOSB", "CEBPA", "DDIT3", "EGR2", "CDKN1A", "GADD45B", "TNF", "HES1", "HBEGF", "BCL6", "NR4A1", "DUSP6", "GADD45G", "ID2", "NFKBIA", "PLK3", "SNAI2", "CREB5", "HLA-G", "HIST1H2BC", "HIST1H2BG", "CALML3", "SNAI1")
+multiome_1_enriched_imputed <- AddModuleScore(multiome_1_enriched_imputed,
+                                        features = list(stress_module),
+                                        name = "stress_module")
+VlnPlot(multiome_1_enriched_imputed, features = "stress_module1")
+## Graph fraction of cells in each cluster
+```{r}
+cluster_percent <- data.frame(matrix(nrow = length(levels(multiome_1_enriched_imputed$seurat_clusters))-1, ncol = 3))
+for (i in 0:length(levels(multiome_1_enriched_imputed$seurat_clusters))-1) {
+  total_cell_num <- length(colnames(multiome_1_enriched_imputed))
+  cluster_num <- length(which(multiome_1_enriched_imputed$seurat_clusters == i))
+  cluster_per <- (cluster_num / total_cell_num)*100
+  cluster_percent[i+1,] <- c(i, c(cluster_per, cluster_num))
+}
+names(cluster_percent) <- c("cluster", "percent", "total")
+
+ggplot(cluster_percent, aes(x = as.factor(cluster), y = percent, fill = as.factor(cluster))) +
+  geom_bar(stat = "identity") +
+  theme(legend.position = "none") +
+  geom_text(aes(label = total))
+```
+
+## Differential expression analysis
+```{r}
+de_genes_multiome_1_enriched_imputed <- FindAllMarkers(multiome_1_enriched_imputed, assay = "SCT", only.pos = TRUE)
+```
+
+## Motif scanning
+```{r}
+# Scan the DNA sequence of each peak for the presence of each motif, and create a Motif object
+DefaultAssay(multiome_1_enriched_imputed) <- "cluster_peaks"
+pwm_set <- getMatrixSet(x = JASPAR2020, opts = list(species = 9606, all_versions = FALSE))
+motif.matrix <- CreateMotifMatrix(features = granges(multiome_1_enriched_imputed), pwm = pwm_set, genome = 'hg38', use.counts = FALSE)
+motif.object <- CreateMotifObject(data = motif.matrix, pwm = pwm_set)
+multiome_1_enriched_imputed <- SetAssayData(multiome_1_enriched_imputed, assay = 'cluster_peaks', slot = 'motifs', new.data = motif.object)
+
+# Note that this step can take 30-60 minutes 
+multiome_1_enriched_imputed <- RunChromVAR(
+  object = multiome_1_enriched_imputed,
+  genome = BSgenome.Hsapiens.UCSC.hg38
+)
+DefaultAssay(multiome_1_enriched_imputed) <- "chromvar"
+
+differential.activity <- FindAllMarkers(
+  object = multiome_1_enriched_imputed,
+  only.pos = TRUE
+)
+
+# get top differentially accessible peaks
+motif.names <- differential.activity$gene
+colnames(differential.activity) <- paste0("motif.", colnames(differential.activity))
+differential.activity$gene <- ConvertMotifID(multiome_1_enriched_imputed, id = motif.names)
+
+cluster11_top_motifs <- slice_min(differential.activity[differential.activity$motif.cluster=="11",], order_by = motif.p_val_adj, n = 10)
+
+cluster11_top_motifs$motif.gene <- factor(cluster11_top_motifs$motif.gene, levels = arrange(cluster11_top_motifs, by = rev(motif.p_val_adj))$motif.gene)
+
+ggplot(cluster11_top_motifs, aes(x = -log10(motif.p_val_adj), y = motif.gene, size = motif.p_val_adj)) +
+  geom_bar(stat = "identity")
+```
